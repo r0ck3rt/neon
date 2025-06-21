@@ -149,8 +149,10 @@ RUN case $DEBIAN_VERSION in \
     ninja-build git autoconf automake libtool build-essential bison flex libreadline-dev \
     zlib1g-dev libxml2-dev libcurl4-openssl-dev libossp-uuid-dev wget ca-certificates pkg-config libssl-dev \
     libicu-dev libxslt1-dev liblz4-dev libzstd-dev zstd curl unzip g++ \
+    libclang-dev \
     $VERSION_INSTALLS \
-    && apt clean && rm -rf /var/lib/apt/lists/*
+    && apt clean && rm -rf /var/lib/apt/lists/* && \
+    useradd -ms /bin/bash nonroot -b /home
 
 #########################################################################################
 #
@@ -603,7 +605,7 @@ RUN case "${PG_VERSION:?}" in \
         ;; \
     esac && \
 	wget https://github.com/knizhnik/online_advisor/archive/refs/tags/1.0.tar.gz -O online_advisor.tar.gz && \
-    echo "059b7d9e5a90013a58bdd22e9505b88406ce05790675eb2d8434e5b215652d54 online_advisor.tar.gz" | sha256sum --check && \
+    echo "37dcadf8f7cc8d6cc1f8831276ee245b44f1b0274f09e511e47a67738ba9ed0f online_advisor.tar.gz" | sha256sum --check && \
     mkdir online_advisor-src && cd online_advisor-src && tar xzf ../online_advisor.tar.gz --strip-components=1 -C .
 
 FROM pg-build AS online_advisor-build
@@ -1057,17 +1059,10 @@ RUN make -j $(getconf _NPROCESSORS_ONLN) && \
 
 #########################################################################################
 #
-# Layer "pg build with nonroot user and cargo installed"
-# This layer is base and common for layers with `pgrx`
+# Layer "build-deps with Rust toolchain installed"
 #
 #########################################################################################
-FROM pg-build AS pg-build-nonroot-with-cargo
-ARG PG_VERSION
-
-RUN apt update && \
-    apt install --no-install-recommends --no-install-suggests -y curl libclang-dev && \
-    apt clean && rm -rf /var/lib/apt/lists/* && \
-    useradd -ms /bin/bash nonroot -b /home
+FROM build-deps AS build-deps-with-cargo
 
 ENV HOME=/home/nonroot
 ENV PATH="/home/nonroot/.cargo/bin:$PATH"
@@ -1084,11 +1079,27 @@ RUN curl -sSO https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux
 
 #########################################################################################
 #
+# Layer "pg-build with Rust toolchain installed"
+# This layer is base and common for layers with `pgrx`
+#
+#########################################################################################
+FROM pg-build AS pg-build-with-cargo
+ARG PG_VERSION
+
+ENV HOME=/home/nonroot
+ENV PATH="/home/nonroot/.cargo/bin:$PATH"
+USER nonroot
+WORKDIR /home/nonroot
+
+COPY --from=build-deps-with-cargo /home/nonroot /home/nonroot
+
+#########################################################################################
+#
 # Layer "rust extensions"
 # This layer is used to build `pgrx` deps
 #
 #########################################################################################
-FROM pg-build-nonroot-with-cargo AS rust-extensions-build
+FROM pg-build-with-cargo AS rust-extensions-build
 ARG PG_VERSION
 
 RUN case "${PG_VERSION:?}" in \
@@ -1110,7 +1121,7 @@ USER root
 # and eventually get merged with `rust-extensions-build`
 #
 #########################################################################################
-FROM pg-build-nonroot-with-cargo AS rust-extensions-build-pgrx12
+FROM pg-build-with-cargo AS rust-extensions-build-pgrx12
 ARG PG_VERSION
 
 RUN cargo install --locked --version 0.12.9 cargo-pgrx && \
@@ -1127,7 +1138,7 @@ USER root
 # and eventually get merged with `rust-extensions-build`
 #
 #########################################################################################
-FROM pg-build-nonroot-with-cargo AS rust-extensions-build-pgrx14
+FROM pg-build-with-cargo AS rust-extensions-build-pgrx14
 ARG PG_VERSION
 
 RUN cargo install --locked --version 0.14.1 cargo-pgrx && \
@@ -1144,10 +1155,12 @@ USER root
 
 FROM build-deps AS pgrag-src
 ARG PG_VERSION
-
 WORKDIR /ext-src
+COPY compute/patches/onnxruntime.patch .
+
 RUN wget https://github.com/microsoft/onnxruntime/archive/refs/tags/v1.18.1.tar.gz -O onnxruntime.tar.gz && \
     mkdir onnxruntime-src && cd onnxruntime-src && tar xzf ../onnxruntime.tar.gz --strip-components=1 -C . && \
+    patch -p1 < /ext-src/onnxruntime.patch && \
     echo "#nothing to test here" > neon-test.sh
 
 RUN wget https://github.com/neondatabase-labs/pgrag/archive/refs/tags/v0.1.2.tar.gz -O pgrag.tar.gz &&  \
@@ -1902,6 +1915,7 @@ COPY compute/patches/pg_repack.patch /ext-src
 RUN cd /ext-src/pg_repack-src && patch -p1 </ext-src/pg_repack.patch && rm -f /ext-src/pg_repack.patch
 
 COPY --chmod=755 docker-compose/run-tests.sh /run-tests.sh
+RUN echo /usr/local/pgsql/lib > /etc/ld.so.conf.d/00-neon.conf && /sbin/ldconfig
 RUN apt-get update && apt-get install -y libtap-parser-sourcehandler-pgtap-perl jq \
    && apt clean && rm -rf /ext-src/*.tar.gz /ext-src/*.patch /var/lib/apt/lists/*
 ENV PATH=/usr/local/pgsql/bin:$PATH

@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};
 
-use crate::{FeatureStore, PostHogClient, PostHogClientConfig};
+use crate::{CaptureEvent, FeatureStore, PostHogClient, PostHogClientConfig};
 
 /// A background loop that fetches feature flags from PostHog and updates the feature store.
 pub struct FeatureResolverBackgroundLoop {
@@ -24,9 +24,16 @@ impl FeatureResolverBackgroundLoop {
         }
     }
 
-    pub fn spawn(self: Arc<Self>, handle: &tokio::runtime::Handle, refresh_period: Duration) {
+    pub fn spawn(
+        self: Arc<Self>,
+        handle: &tokio::runtime::Handle,
+        refresh_period: Duration,
+        fake_tenants: Vec<CaptureEvent>,
+    ) {
         let this = self.clone();
         let cancel = self.cancel.clone();
+
+        // Main loop of updating the feature flags.
         handle.spawn(
             async move {
                 tracing::info!("Starting PostHog feature resolver");
@@ -48,13 +55,36 @@ impl FeatureResolverBackgroundLoop {
                             continue;
                         }
                     };
-                    let feature_store = FeatureStore::new_with_flags(resp.flags);
-                    this.feature_store.store(Arc::new(feature_store));
-                    tracing::info!("Feature flag updated");
+                    let project_id = this.posthog_client.config.project_id.parse::<u64>().ok();
+                    match FeatureStore::new_with_flags(resp.flags, project_id) {
+                        Ok(feature_store) => {
+                            this.feature_store.store(Arc::new(feature_store));
+                            tracing::info!("Feature flag updated");
+                        }
+                        Err(e) => {
+                            tracing::warn!("Cannot process feature flag spec: {}", e);
+                        }
+                    }
                 }
                 tracing::info!("PostHog feature resolver stopped");
             }
             .instrument(info_span!("posthog_feature_resolver")),
+        );
+
+        // Report fake tenants to PostHog so that we have the combination of all the properties in the UI.
+        // Do one report per pageserver restart.
+        let this = self.clone();
+        handle.spawn(
+            async move {
+                tracing::info!("Starting PostHog feature reporter");
+                for tenant in &fake_tenants {
+                    tracing::info!("Reporting fake tenant: {:?}", tenant);
+                }
+                if let Err(e) = this.posthog_client.capture_event_batch(&fake_tenants).await {
+                    tracing::warn!("Cannot report fake tenants: {}", e);
+                }
+            }
+            .instrument(info_span!("posthog_feature_reporter")),
         );
     }
 

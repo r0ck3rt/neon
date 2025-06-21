@@ -18,7 +18,7 @@ use clap::Parser;
 use compute_api::requests::ComputeClaimsScope;
 use compute_api::spec::ComputeMode;
 use control_plane::broker::StorageBroker;
-use control_plane::endpoint::ComputeControlPlane;
+use control_plane::endpoint::{ComputeControlPlane, EndpointTerminateMode, PageserverProtocol};
 use control_plane::endpoint_storage::{ENDPOINT_STORAGE_DEFAULT_ADDR, EndpointStorage};
 use control_plane::local_env;
 use control_plane::local_env::{
@@ -45,7 +45,7 @@ use pageserver_api::models::{
 use pageserver_api::shard::{DEFAULT_STRIPE_SIZE, ShardCount, ShardStripeSize, TenantShardId};
 use postgres_backend::AuthType;
 use postgres_connection::parse_host_port;
-use safekeeper_api::membership::SafekeeperGeneration;
+use safekeeper_api::membership::{SafekeeperGeneration, SafekeeperId};
 use safekeeper_api::{
     DEFAULT_HTTP_LISTEN_PORT as DEFAULT_SAFEKEEPER_HTTP_PORT,
     DEFAULT_PG_LISTEN_PORT as DEFAULT_SAFEKEEPER_PG_PORT,
@@ -605,6 +605,14 @@ struct EndpointCreateCmdArgs {
     #[clap(long, help = "Postgres version")]
     pg_version: u32,
 
+    /// Use gRPC to communicate with Pageservers, by generating grpc:// connstrings.
+    ///
+    /// Specified on creation such that it's retained across reconfiguration and restarts.
+    ///
+    /// NB: not yet supported by computes.
+    #[clap(long)]
+    grpc: bool,
+
     #[clap(
         long,
         help = "If set, the node will be a hot replica on the specified timeline",
@@ -664,6 +672,13 @@ struct EndpointStartCmdArgs {
     #[clap(short = 't', long, value_parser= humantime::parse_duration, help = "timeout until we fail the command")]
     #[arg(default_value = "90s")]
     start_timeout: Duration,
+
+    #[clap(
+        long,
+        help = "Run in development mode, skipping VM-specific operations like process termination",
+        action = clap::ArgAction::SetTrue
+    )]
+    dev: bool,
 }
 
 #[derive(clap::Args)]
@@ -696,10 +711,9 @@ struct EndpointStopCmdArgs {
     )]
     destroy: bool,
 
-    #[clap(long, help = "Postgres shutdown mode, passed to \"pg_ctl -m <mode>\"")]
-    #[arg(value_parser(["smart", "fast", "immediate"]))]
-    #[arg(default_value = "fast")]
-    mode: String,
+    #[clap(long, help = "Postgres shutdown mode")]
+    #[clap(default_value = "fast")]
+    mode: EndpointTerminateMode,
 }
 
 #[derive(clap::Args)]
@@ -1255,6 +1269,45 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
             pageserver
                 .timeline_import(tenant_id, timeline_id, base, pg_wal, args.pg_version)
                 .await?;
+            if env.storage_controller.timelines_onto_safekeepers {
+                println!("Creating timeline on safekeeper ...");
+                let timeline_info = pageserver
+                    .timeline_info(
+                        TenantShardId::unsharded(tenant_id),
+                        timeline_id,
+                        pageserver_client::mgmt_api::ForceAwaitLogicalSize::No,
+                    )
+                    .await?;
+                let default_sk = SafekeeperNode::from_env(env, env.safekeepers.first().unwrap());
+                let default_host = default_sk
+                    .conf
+                    .listen_addr
+                    .clone()
+                    .unwrap_or_else(|| "localhost".to_string());
+                let mconf = safekeeper_api::membership::Configuration {
+                    generation: SafekeeperGeneration::new(1),
+                    members: safekeeper_api::membership::MemberSet {
+                        m: vec![SafekeeperId {
+                            host: default_host,
+                            id: default_sk.conf.id,
+                            pg_port: default_sk.conf.pg_port,
+                        }],
+                    },
+                    new_members: None,
+                };
+                let pg_version = args.pg_version * 10000;
+                let req = safekeeper_api::models::TimelineCreateRequest {
+                    tenant_id,
+                    timeline_id,
+                    mconf,
+                    pg_version,
+                    system_id: None,
+                    wal_seg_size: None,
+                    start_lsn: timeline_info.last_record_lsn,
+                    commit_lsn: None,
+                };
+                default_sk.create_timeline(&req).await?;
+            }
             env.register_branch_mapping(branch_name.to_string(), tenant_id, timeline_id)?;
             println!("Done");
         }
@@ -1412,6 +1465,7 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                 args.internal_http_port,
                 args.pg_version,
                 mode,
+                args.grpc,
                 !args.update_catalog,
                 false,
             )?;
@@ -1452,13 +1506,20 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
 
             let (pageservers, stripe_size) = if let Some(pageserver_id) = pageserver_id {
                 let conf = env.get_pageserver_conf(pageserver_id).unwrap();
-                let parsed = parse_host_port(&conf.listen_pg_addr).expect("Bad config");
-                (
-                    vec![(parsed.0, parsed.1.unwrap_or(5432))],
-                    // If caller is telling us what pageserver to use, this is not a tenant which is
-                    // full managed by storage controller, therefore not sharded.
-                    DEFAULT_STRIPE_SIZE,
-                )
+                // Use gRPC if requested.
+                let pageserver = if endpoint.grpc {
+                    let grpc_addr = conf.listen_grpc_addr.as_ref().expect("bad config");
+                    let (host, port) = parse_host_port(grpc_addr)?;
+                    let port = port.unwrap_or(DEFAULT_PAGESERVER_GRPC_PORT);
+                    (PageserverProtocol::Grpc, host, port)
+                } else {
+                    let (host, port) = parse_host_port(&conf.listen_pg_addr)?;
+                    let port = port.unwrap_or(5432);
+                    (PageserverProtocol::Libpq, host, port)
+                };
+                // If caller is telling us what pageserver to use, this is not a tenant which is
+                // fully managed by storage controller, therefore not sharded.
+                (vec![pageserver], DEFAULT_STRIPE_SIZE)
             } else {
                 // Look up the currently attached location of the tenant, and its striping metadata,
                 // to pass these on to postgres.
@@ -1477,11 +1538,20 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                                 .await?;
                         }
 
-                        anyhow::Ok((
-                            Host::parse(&shard.listen_pg_addr)
-                                .expect("Storage controller reported bad hostname"),
-                            shard.listen_pg_port,
-                        ))
+                        let pageserver = if endpoint.grpc {
+                            (
+                                PageserverProtocol::Grpc,
+                                Host::parse(&shard.listen_grpc_addr.expect("no gRPC address"))?,
+                                shard.listen_grpc_port.expect("no gRPC port"),
+                            )
+                        } else {
+                            (
+                                PageserverProtocol::Libpq,
+                                Host::parse(&shard.listen_pg_addr)?,
+                                shard.listen_pg_port,
+                            )
+                        };
+                        anyhow::Ok(pageserver)
                     }),
                 )
                 .await?;
@@ -1526,6 +1596,7 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                     stripe_size.0 as usize,
                     args.create_test_user,
                     args.start_timeout,
+                    args.dev,
                 )
                 .await?;
         }
@@ -1536,11 +1607,19 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                 .get(endpoint_id.as_str())
                 .with_context(|| format!("postgres endpoint {endpoint_id} is not found"))?;
             let pageservers = if let Some(ps_id) = args.endpoint_pageserver_id {
-                let pageserver = PageServerNode::from_env(env, env.get_pageserver_conf(ps_id)?);
-                vec![(
-                    pageserver.pg_connection_config.host().clone(),
-                    pageserver.pg_connection_config.port(),
-                )]
+                let conf = env.get_pageserver_conf(ps_id)?;
+                // Use gRPC if requested.
+                let pageserver = if endpoint.grpc {
+                    let grpc_addr = conf.listen_grpc_addr.as_ref().expect("bad config");
+                    let (host, port) = parse_host_port(grpc_addr)?;
+                    let port = port.unwrap_or(DEFAULT_PAGESERVER_GRPC_PORT);
+                    (PageserverProtocol::Grpc, host, port)
+                } else {
+                    let (host, port) = parse_host_port(&conf.listen_pg_addr)?;
+                    let port = port.unwrap_or(5432);
+                    (PageserverProtocol::Libpq, host, port)
+                };
+                vec![pageserver]
             } else {
                 let storage_controller = StorageController::from_env(env);
                 storage_controller
@@ -1549,11 +1628,21 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                     .shards
                     .into_iter()
                     .map(|shard| {
-                        (
-                            Host::parse(&shard.listen_pg_addr)
-                                .expect("Storage controller reported malformed host"),
-                            shard.listen_pg_port,
-                        )
+                        // Use gRPC if requested.
+                        if endpoint.grpc {
+                            (
+                                PageserverProtocol::Grpc,
+                                Host::parse(&shard.listen_grpc_addr.expect("no gRPC address"))
+                                    .expect("bad hostname"),
+                                shard.listen_grpc_port.expect("no gRPC port"),
+                            )
+                        } else {
+                            (
+                                PageserverProtocol::Libpq,
+                                Host::parse(&shard.listen_pg_addr).expect("bad hostname"),
+                                shard.listen_pg_port,
+                            )
+                        }
                     })
                     .collect::<Vec<_>>()
             };
@@ -1568,7 +1657,10 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                 .endpoints
                 .get(endpoint_id)
                 .with_context(|| format!("postgres endpoint {endpoint_id} is not found"))?;
-            endpoint.stop(&args.mode, args.destroy)?;
+            match endpoint.stop(args.mode, args.destroy).await?.lsn {
+                Some(lsn) => println!("{lsn}"),
+                None => println!("null"),
+            }
         }
         EndpointCmd::GenerateJwt(args) => {
             let endpoint = {
@@ -2000,11 +2092,16 @@ async fn handle_stop_all(args: &StopCmdArgs, env: &local_env::LocalEnv) -> Resul
 }
 
 async fn try_stop_all(env: &local_env::LocalEnv, immediate: bool) {
+    let mode = if immediate {
+        EndpointTerminateMode::Immediate
+    } else {
+        EndpointTerminateMode::Fast
+    };
     // Stop all endpoints
     match ComputeControlPlane::load(env.clone()) {
         Ok(cplane) => {
             for (_k, node) in cplane.endpoints {
-                if let Err(e) = node.stop(if immediate { "immediate" } else { "fast" }, false) {
+                if let Err(e) = node.stop(mode, false).await {
                     eprintln!("postgres stop failed: {e:#}");
                 }
             }

@@ -39,6 +39,9 @@ pub struct LocalEvaluationResponse {
 
 #[derive(Deserialize)]
 pub struct LocalEvaluationFlag {
+    #[allow(dead_code)]
+    id: u64,
+    team_id: u64,
     key: String,
     filters: LocalEvaluationFlagFilters,
     active: bool,
@@ -64,7 +67,7 @@ pub struct LocalEvaluationFlagFilterProperty {
     operator: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum PostHogFlagFilterPropertyValue {
     String(String),
@@ -107,17 +110,32 @@ impl FeatureStore {
         }
     }
 
-    pub fn new_with_flags(flags: Vec<LocalEvaluationFlag>) -> Self {
+    pub fn new_with_flags(
+        flags: Vec<LocalEvaluationFlag>,
+        project_id: Option<u64>,
+    ) -> Result<Self, &'static str> {
         let mut store = Self::new();
-        store.set_flags(flags);
-        store
+        store.set_flags(flags, project_id)?;
+        Ok(store)
     }
 
-    pub fn set_flags(&mut self, flags: Vec<LocalEvaluationFlag>) {
+    pub fn set_flags(
+        &mut self,
+        flags: Vec<LocalEvaluationFlag>,
+        project_id: Option<u64>,
+    ) -> Result<(), &'static str> {
         self.flags.clear();
         for flag in flags {
+            if let Some(project_id) = project_id {
+                if flag.team_id != project_id {
+                    return Err(
+                        "Retrieved a spec with different project id, wrong config? Discarding the feature flags.",
+                    );
+                }
+            }
             self.flags.insert(flag.key.clone(), flag);
         }
+        Ok(())
     }
 
     /// Generate a consistent hash for a user ID (e.g., tenant ID).
@@ -507,6 +525,13 @@ pub struct PostHogClient {
     client: reqwest::Client,
 }
 
+#[derive(Serialize, Debug)]
+pub struct CaptureEvent {
+    pub event: String,
+    pub distinct_id: String,
+    pub properties: serde_json::Value,
+}
+
 impl PostHogClient {
     pub fn new(config: PostHogClientConfig) -> Self {
         let client = reqwest::Client::new();
@@ -527,6 +552,13 @@ impl PostHogClient {
         })
     }
 
+    /// Check if the server API key is a feature flag secure API key. This key can only be
+    /// used to fetch the feature flag specs and can only be used on a undocumented API
+    /// endpoint.
+    fn is_feature_flag_secure_api_key(&self) -> bool {
+        self.config.server_api_key.starts_with("phs_")
+    }
+
     /// Fetch the feature flag specs from the server.
     ///
     /// This is unfortunately an undocumented API at:
@@ -540,10 +572,22 @@ impl PostHogClient {
     ) -> anyhow::Result<LocalEvaluationResponse> {
         // BASE_URL/api/projects/:project_id/feature_flags/local_evaluation
         // with bearer token of self.server_api_key
-        let url = format!(
-            "{}/api/projects/{}/feature_flags/local_evaluation",
-            self.config.private_api_url, self.config.project_id
-        );
+        // OR
+        // BASE_URL/api/feature_flag/local_evaluation/
+        // with bearer token of feature flag specific self.server_api_key
+        let url = if self.is_feature_flag_secure_api_key() {
+            // The new feature local evaluation secure API token
+            format!(
+                "{}/api/feature_flag/local_evaluation",
+                self.config.private_api_url
+            )
+        } else {
+            // The old personal API token
+            format!(
+                "{}/api/projects/{}/feature_flags/local_evaluation",
+                self.config.private_api_url, self.config.project_id
+            )
+        };
         let response = self
             .client
             .get(url)
@@ -570,12 +614,12 @@ impl PostHogClient {
         &self,
         event: &str,
         distinct_id: &str,
-        properties: &HashMap<String, PostHogFlagFilterPropertyValue>,
+        properties: &serde_json::Value,
     ) -> anyhow::Result<()> {
         // PUBLIC_URL/capture/
-        // with bearer token of self.client_api_key
         let url = format!("{}/capture/", self.config.public_api_url);
-        self.client
+        let response = self
+            .client
             .post(url)
             .body(serde_json::to_string(&json!({
                 "api_key": self.config.client_api_key,
@@ -585,6 +629,39 @@ impl PostHogClient {
             }))?)
             .send()
             .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "Failed to capture events: {}, {}",
+                status,
+                body
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn capture_event_batch(&self, events: &[CaptureEvent]) -> anyhow::Result<()> {
+        // PUBLIC_URL/batch/
+        let url = format!("{}/batch/", self.config.public_api_url);
+        let response = self
+            .client
+            .post(url)
+            .body(serde_json::to_string(&json!({
+                "api_key": self.config.client_api_key,
+                "batch": events,
+            }))?)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "Failed to capture events: {}, {}",
+                status,
+                body
+            ));
+        }
         Ok(())
     }
 }
@@ -763,7 +840,7 @@ mod tests {
     fn evaluate_multivariate() {
         let mut store = FeatureStore::new();
         let response: LocalEvaluationResponse = serde_json::from_str(data()).unwrap();
-        store.set_flags(response.flags);
+        store.set_flags(response.flags, None).unwrap();
 
         // This lacks the required properties and cannot be evaluated.
         let variant =
@@ -833,7 +910,7 @@ mod tests {
 
         let mut store = FeatureStore::new();
         let response: LocalEvaluationResponse = serde_json::from_str(data()).unwrap();
-        store.set_flags(response.flags);
+        store.set_flags(response.flags, None).unwrap();
 
         // This lacks the required properties and cannot be evaluated.
         let variant = store.evaluate_boolean_inner("boolean-flag", 1.00, &HashMap::new());
@@ -889,7 +966,7 @@ mod tests {
 
         let mut store = FeatureStore::new();
         let response: LocalEvaluationResponse = serde_json::from_str(data()).unwrap();
-        store.set_flags(response.flags);
+        store.set_flags(response.flags, None).unwrap();
 
         // This lacks the required properties and cannot be evaluated.
         let variant =

@@ -2,14 +2,11 @@
 mod tests;
 
 pub(crate) mod connect_compute;
-mod copy_bidirectional;
-pub(crate) mod handshake;
-pub(crate) mod passthrough;
 pub(crate) mod retry;
 pub(crate) mod wake_compute;
+
 use std::sync::Arc;
 
-pub use copy_bidirectional::{ErrorSource, copy_bidirectional_client_compute};
 use futures::FutureExt;
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
@@ -21,19 +18,21 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, warn};
 
-use self::connect_compute::{TcpMechanism, connect_to_compute};
-use self::passthrough::ProxyPassthrough;
 use crate::cancellation::{self, CancellationHandler};
 use crate::config::{ProxyConfig, ProxyProtocolV2, TlsConfig};
 use crate::context::RequestContext;
 use crate::error::{ReportableError, UserFacingError};
 use crate::metrics::{Metrics, NumClientConnectionsGuard};
+pub use crate::pglb::copy_bidirectional::{ErrorSource, copy_bidirectional_client_compute};
+use crate::pglb::handshake::{HandshakeData, HandshakeError, handshake};
+use crate::pglb::passthrough::ProxyPassthrough;
 use crate::pqproto::{BeMessage, CancelKeyData, StartupMessageParams};
 use crate::protocol2::{ConnectHeader, ConnectionInfo, ConnectionInfoExtra, read_proxy_protocol};
-use crate::proxy::handshake::{HandshakeData, handshake};
+use crate::proxy::connect_compute::{TcpMechanism, connect_to_compute};
 use crate::rate_limiter::EndpointRateLimiter;
 use crate::stream::{PqStream, Stream};
 use crate::types::EndpointCacheKey;
+use crate::util::run_until_cancelled;
 use crate::{auth, compute};
 
 const ERR_INSECURE_CONNECTION: &str = "connection is insecure (try using `sslmode=require`)";
@@ -49,21 +48,6 @@ impl ReportableError for TlsRequired {
 }
 
 impl UserFacingError for TlsRequired {}
-
-pub async fn run_until_cancelled<F: std::future::Future>(
-    f: F,
-    cancellation_token: &CancellationToken,
-) -> Option<F::Output> {
-    match futures::future::select(
-        std::pin::pin!(f),
-        std::pin::pin!(cancellation_token.cancelled()),
-    )
-    .await
-    {
-        futures::future::Either::Left((f, _)) => Some(f),
-        futures::future::Either::Right(((), _)) => None,
-    }
-}
 
 pub async fn task_main(
     config: &'static ProxyConfig,
@@ -102,30 +86,24 @@ pub async fn task_main(
         let endpoint_rate_limiter2 = endpoint_rate_limiter.clone();
 
         connections.spawn(async move {
-            let (socket, conn_info) = match read_proxy_protocol(socket).await {
-                Err(e) => {
-                    warn!("per-client task finished with an error: {e:#}");
-                    return;
+            let (socket, conn_info) = match config.proxy_protocol_v2 {
+                ProxyProtocolV2::Required => {
+                    match read_proxy_protocol(socket).await {
+                        Err(e) => {
+                            warn!("per-client task finished with an error: {e:#}");
+                            return;
+                        }
+                        // our load balancers will not send any more data. let's just exit immediately
+                        Ok((_socket, ConnectHeader::Local)) => {
+                            debug!("healthcheck received");
+                            return;
+                        }
+                        Ok((socket, ConnectHeader::Proxy(info))) => (socket, info),
+                    }
                 }
-                // our load balancers will not send any more data. let's just exit immediately
-                Ok((_socket, ConnectHeader::Local)) => {
-                    debug!("healthcheck received");
-                    return;
-                }
-                Ok((_socket, ConnectHeader::Missing))
-                    if config.proxy_protocol_v2 == ProxyProtocolV2::Required =>
-                {
-                    warn!("missing required proxy protocol header");
-                    return;
-                }
-                Ok((_socket, ConnectHeader::Proxy(_)))
-                    if config.proxy_protocol_v2 == ProxyProtocolV2::Rejected =>
-                {
-                    warn!("proxy protocol header not supported");
-                    return;
-                }
-                Ok((socket, ConnectHeader::Proxy(info))) => (socket, info),
-                Ok((socket, ConnectHeader::Missing)) => (
+                // ignore the header - it cannot be confused for a postgres or http connection so will
+                // error later.
+                ProxyProtocolV2::Rejected => (
                     socket,
                     ConnectionInfo {
                         addr: peer_addr,
@@ -134,7 +112,7 @@ pub async fn task_main(
                 ),
             };
 
-            match socket.inner.set_nodelay(true) {
+            match socket.set_nodelay(true) {
                 Ok(()) => {}
                 Err(e) => {
                     error!(
@@ -177,7 +155,7 @@ pub async fn task_main(
                 Ok(Some(p)) => {
                     ctx.set_success();
                     let _disconnect = ctx.log_connect();
-                    match p.proxy_pass(&config.connect_to_compute).await {
+                    match p.proxy_pass().await {
                         Ok(()) => {}
                         Err(ErrorSource::Client(e)) => {
                             warn!(
@@ -248,7 +226,7 @@ pub(crate) enum ClientRequestError {
     #[error("{0}")]
     Cancellation(#[from] cancellation::CancelError),
     #[error("{0}")]
-    Handshake(#[from] handshake::HandshakeError),
+    Handshake(#[from] HandshakeError),
     #[error("{0}")]
     HandshakeTimeout(#[from] tokio::time::error::Elapsed),
     #[error("{0}")]
@@ -368,24 +346,22 @@ pub(crate) async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
         }
     };
 
-    let compute_user_info = match &user_info {
-        auth::Backend::ControlPlane(_, info) => &info.info,
+    let (cplane, creds) = match user_info {
+        auth::Backend::ControlPlane(cplane, creds) => (cplane, creds),
         auth::Backend::Local(_) => unreachable!("local proxy does not run tcp proxy service"),
     };
-    let params_compat = compute_user_info
-        .options
-        .get(NeonOptions::PARAMS_COMPAT)
-        .is_some();
+    let params_compat = creds.info.options.get(NeonOptions::PARAMS_COMPAT).is_some();
+    let mut auth_info = compute::AuthInfo::with_auth_keys(creds.keys);
+    auth_info.set_startup_params(&params, params_compat);
 
     let res = connect_to_compute(
         ctx,
         &TcpMechanism {
-            user_info: compute_user_info.clone(),
-            params_compat,
-            params: &params,
+            user_info: creds.info.clone(),
+            auth: auth_info,
             locks: &config.connect_compute_locks,
         },
-        &user_info,
+        &auth::Backend::ControlPlane(cplane, creds.info),
         config.wake_compute_retry_config,
         &config.connect_to_compute,
     )
@@ -396,12 +372,23 @@ pub(crate) async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
         Err(e) => Err(stream.throw_error(e, Some(ctx)).await)?,
     };
 
-    let cancellation_handler_clone = Arc::clone(&cancellation_handler);
-    let session = cancellation_handler_clone.get_key();
+    let session = cancellation_handler.get_key();
 
-    session.write_cancel_key(node.cancel_closure.clone())?;
     prepare_client_connection(&node, *session.key(), &mut stream);
     let stream = stream.flush_and_into_inner().await?;
+
+    let session_id = ctx.session_id();
+    let (cancel_on_shutdown, cancel) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        session
+            .maintain_cancel_key(
+                session_id,
+                cancel,
+                &node.cancel_closure,
+                &config.connect_to_compute,
+            )
+            .await;
+    });
 
     let private_link_id = match ctx.extra() {
         Some(ConnectionInfoExtra::Aws { vpce_id }) => Some(vpce_id.clone()),
@@ -411,13 +398,16 @@ pub(crate) async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     Ok(Some(ProxyPassthrough {
         client: stream,
-        aux: node.aux.clone(),
+        compute: node.stream,
+
+        aux: node.aux,
         private_link_id,
-        compute: node,
-        session_id: ctx.session_id(),
-        cancel: session,
+
+        _cancel_on_shutdown: cancel_on_shutdown,
+
         _req: request_gauge,
         _conn: conn_gauge,
+        _db_conn: node.guage,
     }))
 }
 
